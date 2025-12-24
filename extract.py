@@ -86,6 +86,24 @@ def quantize_to_n_colors(
         if min_dist > 15.0:  # Ensure palette colors are distinct
             palette.append(color)
 
+    # Fill remaining slots by covering gaps (colors with highest error)
+    if len(palette) < n:
+        unique = list(set(colors))
+        for _ in range(n - len(palette)):
+            # Find the color with highest error to current palette
+            worst_color = None
+            worst_error = 0
+            for c in unique:
+                err = min(color_distance(c, p) for p in palette)
+                if err > worst_error:
+                    worst_error = err
+                    worst_color = c
+            if worst_color and worst_error > 10:  # Only add if there's a meaningful gap
+                palette.append(worst_color)
+                unique.remove(worst_color)
+            else:
+                break
+
     return palette
 
 
@@ -103,7 +121,7 @@ def compute_max_error(
 
 def extract_palette(
     colors: list[tuple[int, int, int, int]],
-    max_error: float = 25.0,
+    max_error: float = 15.0,
     verbose: bool = False,
 ) -> list[tuple[int, int, int, int]]:
     """
