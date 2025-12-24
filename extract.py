@@ -566,7 +566,7 @@ def score_grid_alignment(edge_signal: np.ndarray, cell_size: float, offset: floa
     return boundary_score - center_score * 0.5
 
 
-def find_period_autocorr(signal: np.ndarray, min_period: int = 3, max_period: int = 50) -> int:
+def find_period_autocorr(signal: np.ndarray, min_period: int = 3, max_period: int = 100) -> int:
     """Find the dominant period in a signal using autocorrelation."""
     # Normalize signal
     signal = signal - np.mean(signal)
@@ -591,12 +591,570 @@ def find_period_autocorr(signal: np.ndarray, min_period: int = 3, max_period: in
     return best_period
 
 
-def find_best_grid(img_array: np.ndarray, min_period: int = 3, max_period: int = 20) -> tuple[int, int, float, float]:
+def find_edge_position(
+    img_array: np.ndarray,
+    start_x: int,
+    start_y: int,
+    dx: int,
+    dy: int,
+    max_dist: int,
+    min_edge_strength: float = 15.0,
+) -> tuple[int | None, float]:
+    """
+    Scan from start position in direction (dx, dy) to find the strongest edge.
+    Returns (distance to max gradient, max gradient strength).
+    """
+    height, width = img_array.shape[:2]
+
+    best_dist = None
+    best_strength = 0.0
+
+    if len(img_array.shape) == 3:
+        prev_color = img_array[start_y, start_x, :3].astype(float)
+    else:
+        prev_color = np.array([img_array[start_y, start_x]]).astype(float)
+
+    for dist in range(1, max_dist + 1):
+        x = start_x + dx * dist
+        y = start_y + dy * dist
+
+        if not (0 <= x < width and 0 <= y < height):
+            break
+
+        if len(img_array.shape) == 3:
+            curr_color = img_array[y, x, :3].astype(float)
+        else:
+            curr_color = np.array([img_array[y, x]]).astype(float)
+
+        color_diff = np.sqrt(np.sum((curr_color - prev_color) ** 2))
+
+        if color_diff > best_strength:
+            best_strength = color_diff
+            best_dist = dist
+
+        prev_color = curr_color
+
+    # Only return if edge is strong enough
+    if best_strength >= min_edge_strength:
+        return best_dist, best_strength
+    return None, 0.0
+
+
+def refine_center_by_edges(
+    img_array: np.ndarray,
+    cx: int,
+    cy: int,
+    cell_w: float,
+    cell_h: float,
+) -> tuple[int, int]:
+    """
+    Refine center by finding actual edge positions in all 4 directions
+    and computing a weighted midpoint based on edge strength.
+    """
+    max_dist = int(max(cell_w, cell_h) * 0.7)
+
+    # Find edges in all 4 directions (now returns strength too)
+    left_dist, left_str = find_edge_position(img_array, cx, cy, -1, 0, max_dist)
+    right_dist, right_str = find_edge_position(img_array, cx, cy, 1, 0, max_dist)
+    up_dist, up_str = find_edge_position(img_array, cx, cy, 0, -1, max_dist)
+    down_dist, down_str = find_edge_position(img_array, cx, cy, 0, 1, max_dist)
+
+    new_cx, new_cy = float(cx), float(cy)
+
+    # Horizontal: use both edges if found, or infer from one strong edge + expected cell width
+    if left_dist is not None and right_dist is not None:
+        # Both edges found - use simple midpoint (edge strength determines trust, not position)
+        left_edge = cx - left_dist
+        right_edge = cx + right_dist
+        new_cx = (left_edge + right_edge) / 2
+    elif left_dist is not None and left_str > 30:
+        # Only left edge found (strong) - estimate right from cell width
+        left_edge = cx - left_dist
+        new_cx = left_edge + cell_w / 2
+    elif right_dist is not None and right_str > 30:
+        # Only right edge found (strong) - estimate left from cell width
+        right_edge = cx + right_dist
+        new_cx = right_edge - cell_w / 2
+
+    # Vertical: same logic
+    if up_dist is not None and down_dist is not None:
+        # Both edges found - use simple midpoint
+        up_edge = cy - up_dist
+        down_edge = cy + down_dist
+        new_cy = (up_edge + down_edge) / 2
+    elif up_dist is not None and up_str > 30:
+        up_edge = cy - up_dist
+        new_cy = up_edge + cell_h / 2
+    elif down_dist is not None and down_str > 30:
+        down_edge = cy + down_dist
+        new_cy = down_edge - cell_h / 2
+
+    return int(new_cx), int(new_cy)
+
+
+def compute_center_score(
+    img_array: np.ndarray,
+    cx: int,
+    cy: int,
+    radius: int,
+) -> float:
+    """
+    Score a candidate center point. Lower is better.
+
+    Considers:
+    - Color variance in neighborhood (lower = better, more uniform)
+    - Edge strength at point (lower = better, away from boundaries)
+    """
+    height, width = img_array.shape[:2]
+
+    # Clamp to bounds
+    x1 = max(0, cx - radius)
+    x2 = min(width, cx + radius + 1)
+    y1 = max(0, cy - radius)
+    y2 = min(height, cy + radius + 1)
+
+    region = img_array[y1:y2, x1:x2]
+    if region.size == 0:
+        return float('inf')
+
+    # Color variance penalty (want low variance = uniform color)
+    if len(region.shape) == 3:
+        pixels = region.reshape(-1, 3).astype(float)
+    else:
+        pixels = region.reshape(-1, 1).astype(float)
+
+    variance = np.mean(np.var(pixels, axis=0))
+
+    # Edge strength penalty (want low edge = center of pixel, not boundary)
+    # Compute gradient magnitude at center
+    if 0 < cx < width - 1 and 0 < cy < height - 1:
+        if len(img_array.shape) == 3:
+            center_pixel = img_array[cy, cx, :3].astype(float)
+            neighbors = [
+                img_array[cy-1, cx, :3].astype(float),
+                img_array[cy+1, cx, :3].astype(float),
+                img_array[cy, cx-1, :3].astype(float),
+                img_array[cy, cx+1, :3].astype(float),
+            ]
+        else:
+            center_pixel = np.array([img_array[cy, cx]]).astype(float)
+            neighbors = [
+                np.array([img_array[cy-1, cx]]).astype(float),
+                np.array([img_array[cy+1, cx]]).astype(float),
+                np.array([img_array[cy, cx-1]]).astype(float),
+                np.array([img_array[cy, cx+1]]).astype(float),
+            ]
+
+        edge_strength = np.mean([np.sqrt(np.sum((center_pixel - n) ** 2)) for n in neighbors])
+    else:
+        edge_strength = 0
+
+    # Combined score (lower is better)
+    return variance + edge_strength * 2
+
+
+def find_edge_bounds(
+    img_array: np.ndarray,
+    start_x: int,
+    start_y: int,
+    dx: int,
+    dy: int,
+    center_color: np.ndarray,
+    max_dist: int,
+    color_threshold: float = 25.0,
+) -> tuple[int | None, int | None]:
+    """
+    Scan from start position to find edge transition zone.
+    Returns (last_stable_of_my_color, first_stable_of_next_color) as distances.
+    Returns (None, None) if no edge found (same color continues).
+    """
+    height, width = img_array.shape[:2]
+
+    last_stable_mine = 0  # Last position still matching center color
+    first_stable_next = None  # First position that's stable at a different color
+
+    in_transition = False
+    transition_start = None
+
+    for dist in range(1, max_dist + 1):
+        x = start_x + dx * dist
+        y = start_y + dy * dist
+
+        if not (0 <= x < width and 0 <= y < height):
+            break
+
+        if len(img_array.shape) == 3:
+            pixel_color = img_array[y, x, :3].astype(float)
+        else:
+            pixel_color = np.array([img_array[y, x]]).astype(float)
+
+        color_diff = np.sqrt(np.sum((pixel_color - center_color) ** 2))
+
+        if color_diff < color_threshold:
+            # Still my color
+            last_stable_mine = dist
+            in_transition = False
+            transition_start = None
+        else:
+            # Different color - are we in transition or stable?
+            if not in_transition:
+                in_transition = True
+                transition_start = dist
+
+            # If color has changed drastically from center, treat as "definitely next color"
+            # even if not yet stable (handles sharp visual edges in blurry transitions)
+            if color_diff > color_threshold * 2.5:
+                first_stable_next = dist
+                break
+
+            # Check if color has stabilized (look ahead a bit)
+            if dist + 2 <= max_dist:
+                x2 = start_x + dx * (dist + 1)
+                y2 = start_y + dy * (dist + 1)
+                x3 = start_x + dx * (dist + 2)
+                y3 = start_y + dy * (dist + 2)
+
+                if (0 <= x2 < width and 0 <= y2 < height and
+                    0 <= x3 < width and 0 <= y3 < height):
+                    if len(img_array.shape) == 3:
+                        c2 = img_array[y2, x2, :3].astype(float)
+                        c3 = img_array[y3, x3, :3].astype(float)
+                    else:
+                        c2 = np.array([img_array[y2, x2]]).astype(float)
+                        c3 = np.array([img_array[y3, x3]]).astype(float)
+
+                    # Check if next pixels are similar to current (stable)
+                    # AND significantly different from center (truly in neighbor region)
+                    diff_to_next = np.sqrt(np.sum((pixel_color - c2) ** 2))
+                    diff_next_pair = np.sqrt(np.sum((c2 - c3) ** 2))
+                    diff_from_center = np.sqrt(np.sum((pixel_color - center_color) ** 2))
+
+                    # Must be stable (consecutive pixels similar) AND
+                    # clearly in neighbor territory (far from center color)
+                    if (diff_to_next < color_threshold and
+                        diff_next_pair < color_threshold and
+                        diff_from_center > color_threshold * 1.5):
+                        # Color has stabilized at this new value
+                        first_stable_next = dist
+                        break
+            else:
+                # Near max dist, assume stable if different
+                first_stable_next = dist
+                break
+
+    if first_stable_next is None:
+        # No edge found - same color continues
+        return None, None
+
+    return last_stable_mine, first_stable_next
+
+
+def find_center_from_edges(
+    img_array: np.ndarray,
+    cx: int,
+    cy: int,
+    cell_w: float,
+    cell_h: float,
+    position_grid: dict | None = None,
+    col: int = 0,
+    row: int = 0,
+) -> tuple[float, float, bool]:
+    """
+    Find center by locating edge midpoints in all 4 directions.
+    Returns (new_cx, new_cy, is_confident) as floats.
+
+    For edges that don't exist (same color neighbor), uses position_grid
+    to infer the coordinate from nearby placed centers.
+    """
+    height, width = img_array.shape[:2]
+    max_dist = int(max(cell_w, cell_h) * 0.8)
+
+    # Get center color
+    if len(img_array.shape) == 3:
+        center_color = img_array[cy, cx, :3].astype(float)
+    else:
+        center_color = np.array([img_array[cy, cx]]).astype(float)
+
+    # Find edges in all 4 directions
+    left = find_edge_bounds(img_array, cx, cy, -1, 0, center_color, max_dist)
+    right = find_edge_bounds(img_array, cx, cy, 1, 0, center_color, max_dist)
+    up = find_edge_bounds(img_array, cx, cy, 0, -1, center_color, max_dist)
+    down = find_edge_bounds(img_array, cx, cy, 0, 1, center_color, max_dist)
+
+    new_cx, new_cy = float(cx), float(cy)
+    confident = True
+
+    # Horizontal center from left/right edges
+    if left[0] is not None and right[0] is not None:
+        # Both edges found - midpoint of edge midpoints
+        left_edge = cx - (left[0] + left[1]) / 2
+        right_edge = cx + (right[0] + right[1]) / 2
+        new_cx = (left_edge + right_edge) / 2
+    elif left[0] is not None:
+        # Only left edge - use cell width to estimate
+        left_edge = cx - (left[0] + left[1]) / 2
+        new_cx = left_edge + cell_w / 2
+        confident = False
+    elif right[0] is not None:
+        # Only right edge
+        right_edge = cx + (right[0] + right[1]) / 2
+        new_cx = right_edge - cell_w / 2
+        confident = False
+    elif position_grid is not None:
+        # No edges - infer from neighbors
+        for dc in [-1, 1]:
+            nc = col + dc
+            if (nc, row) in position_grid:
+                neighbor_cx, _ = position_grid[(nc, row)]
+                new_cx = neighbor_cx - dc * cell_w
+                confident = False
+                break
+
+    # Vertical center from up/down edges
+    if up[0] is not None and down[0] is not None:
+        up_edge = cy - (up[0] + up[1]) / 2
+        down_edge = cy + (down[0] + down[1]) / 2
+        new_cy = (up_edge + down_edge) / 2
+    elif up[0] is not None:
+        up_edge = cy - (up[0] + up[1]) / 2
+        new_cy = up_edge + cell_h / 2
+        confident = False
+    elif down[0] is not None:
+        down_edge = cy + (down[0] + down[1]) / 2
+        new_cy = down_edge - cell_h / 2
+        confident = False
+    elif position_grid is not None:
+        for dr in [-1, 1]:
+            nr = row + dr
+            if (col, nr) in position_grid:
+                _, neighbor_cy = position_grid[(col, nr)]
+                new_cy = neighbor_cy - dr * cell_h
+                confident = False
+                break
+
+    return new_cx, new_cy, confident
+
+
+def compute_center_confidence(
+    img_array: np.ndarray,
+    cx: int,
+    cy: int,
+    cell_w: float,
+    cell_h: float,
+) -> float:
+    """
+    Compute confidence score for a center based on nearby edge strength.
+    Higher = more confident (strong edges on ALL 4 sides).
+
+    Returns the MINIMUM edge strength across all 4 boundaries.
+    A pixel is only confident if all 4 edges are present.
+    """
+    height, width = img_array.shape[:2]
+
+    half_w = int(cell_w / 2)
+    half_h = int(cell_h / 2)
+
+    edge_strengths = []
+
+    # Left boundary - check horizontal gradient
+    bx, by = cx - half_w, cy
+    if 1 <= bx < width - 1 and 0 <= by < height:
+        if len(img_array.shape) == 3:
+            grad = np.sqrt(np.sum((img_array[by, bx+1, :3].astype(float) -
+                                   img_array[by, bx-1, :3].astype(float)) ** 2))
+        else:
+            grad = abs(float(img_array[by, bx+1]) - float(img_array[by, bx-1]))
+        edge_strengths.append(grad)
+
+    # Right boundary - check horizontal gradient
+    bx, by = cx + half_w, cy
+    if 1 <= bx < width - 1 and 0 <= by < height:
+        if len(img_array.shape) == 3:
+            grad = np.sqrt(np.sum((img_array[by, bx+1, :3].astype(float) -
+                                   img_array[by, bx-1, :3].astype(float)) ** 2))
+        else:
+            grad = abs(float(img_array[by, bx+1]) - float(img_array[by, bx-1]))
+        edge_strengths.append(grad)
+
+    # Top boundary - check vertical gradient
+    bx, by = cx, cy - half_h
+    if 0 <= bx < width and 1 <= by < height - 1:
+        if len(img_array.shape) == 3:
+            grad = np.sqrt(np.sum((img_array[by+1, bx, :3].astype(float) -
+                                   img_array[by-1, bx, :3].astype(float)) ** 2))
+        else:
+            grad = abs(float(img_array[by+1, bx]) - float(img_array[by-1, bx]))
+        edge_strengths.append(grad)
+
+    # Bottom boundary - check vertical gradient
+    bx, by = cx, cy + half_h
+    if 0 <= bx < width and 1 <= by < height - 1:
+        if len(img_array.shape) == 3:
+            grad = np.sqrt(np.sum((img_array[by+1, bx, :3].astype(float) -
+                                   img_array[by-1, bx, :3].astype(float)) ** 2))
+        else:
+            grad = abs(float(img_array[by+1, bx]) - float(img_array[by-1, bx]))
+        edge_strengths.append(grad)
+
+    # Return minimum - confident only if ALL edges are strong
+    if len(edge_strengths) == 4:
+        return min(edge_strengths)
+    else:
+        return 0.0  # Missing boundaries = not confident
+
+
+def refine_centers_locally(
+    img_array: np.ndarray,
+    centers: list[tuple[int, int, int, int]],
+    cell_w: float,
+    cell_h: float,
+    search_radius: float = 0.3,
+    debug_path: str | Path | None = None,
+    debug_img: Image.Image | None = None,
+) -> list[tuple[int, int, int, int]]:
+    """
+    Refine each center locally to find the best position.
+    Uses confidence weighting: high-confidence centers anchor low-confidence ones.
+
+    Args:
+        img_array: Input image
+        centers: List of (col, row, cx, cy) tuples
+        cell_w, cell_h: Cell dimensions
+        search_radius: Fraction of cell size to search (0.3 = ±30%)
+
+    Returns:
+        Refined centers list
+    """
+    height, width = img_array.shape[:2]
+    n_cols = max(c[0] for c in centers) + 1
+    n_rows = max(c[1] for c in centers) + 1
+
+    # Search window size
+    search_w = max(2, int(cell_w * search_radius))
+    search_h = max(2, int(cell_h * search_radius))
+
+    # Scoring radius
+    score_radius = max(2, int(min(cell_w, cell_h) * 0.25))
+
+    # First pass: refine all centers using edge midpoints and compute confidence
+    refined_with_conf = {}
+
+    for col, row, cx, cy in centers:
+        # Refine by finding midpoint between edge midpoints
+        refined_cx, refined_cy, is_confident = find_center_from_edges(
+            img_array, cx, cy, cell_w, cell_h
+        )
+
+        # Clamp refinement to max 2 pixels in each dimension
+        dx = refined_cx - cx
+        dy = refined_cy - cy
+        clamped_dx = max(-2, min(2, dx))
+        clamped_dy = max(-2, min(2, dy))
+        best_cx = cx + clamped_dx
+        best_cy = cy + clamped_dy
+
+        # Reduce confidence if we had to clamp
+        if abs(dx) > 2 or abs(dy) > 2:
+            is_confident = False
+
+        # Round only for confidence calculation (needs integer coords for array access)
+        confidence = compute_center_confidence(img_array, int(round(best_cx)), int(round(best_cy)), cell_w, cell_h)
+        # Reduce confidence if edge detection wasn't confident
+        if not is_confident:
+            confidence *= 0.5
+        refined_with_conf[(col, row)] = (best_cx, best_cy, confidence)
+
+    # Sort confidences to determine percentile thresholds
+    all_conf = sorted([c[2] for c in refined_with_conf.values()], reverse=True)
+
+    # Iteratively place centers from high confidence to low
+    # Start with top 10%, then 20%, 30%, etc.
+    position_grid = {}  # (col, row) -> (cx, cy) once placed
+
+    percentile_steps = [98]  # Focus on highest confidence first
+
+    for step_idx, percentile in enumerate(percentile_steps):
+        conf_threshold = np.percentile(all_conf, percentile) if percentile > 0 else -1
+        placed_this_round = 0
+
+        for col, row, orig_cx, orig_cy in centers:
+            if (col, row) in position_grid:
+                continue  # already placed
+
+            cx, cy, conf = refined_with_conf[(col, row)]
+
+            if conf >= conf_threshold:
+                # This cell qualifies at this confidence level
+                # Check if we have already-placed neighbors to constrain us
+                predictions = []
+
+                for dc, dr in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                    nc, nr = col + dc, row + dr
+                    if (nc, nr) in position_grid:
+                        ncx, ncy = position_grid[(nc, nr)]
+                        pred_cx = ncx - dc * cell_w
+                        pred_cy = ncy - dr * cell_h
+                        predictions.append((pred_cx, pred_cy))
+
+                if predictions:
+                    # Blend refined position with neighbor predictions
+                    avg_pred_cx = np.mean([p[0] for p in predictions])
+                    avg_pred_cy = np.mean([p[1] for p in predictions])
+
+                    # Higher confidence = trust refined more, lower = trust neighbors more
+                    # Normalize confidence to 0-1 range
+                    max_conf = all_conf[0] if all_conf[0] > 0 else 1
+                    norm_conf = min(1.0, conf / max_conf)
+
+                    # Blend: high conf -> more weight on refined, low conf -> more weight on neighbors
+                    blend = 0.3 + 0.5 * norm_conf  # ranges from 0.3 to 0.8
+                    final_cx = cx * blend + avg_pred_cx * (1 - blend)
+                    final_cy = cy * blend + avg_pred_cy * (1 - blend)
+
+                    position_grid[(col, row)] = (final_cx, final_cy)
+                else:
+                    # No neighbors yet - use refined position directly
+                    position_grid[(col, row)] = (cx, cy)
+
+                placed_this_round += 1
+
+        # Save debug image for this iteration
+        if debug_path and debug_img:
+            iter_path = Path(debug_path).parent / f"{Path(debug_path).stem}_iter{step_idx}_p{percentile}.png"
+            current_centers = [(int(round(cx)), int(round(cy))) for cx, cy in position_grid.values()]
+            save_debug_centers(debug_img, current_centers, iter_path)
+
+            # Also save edge visualization for first iteration
+            if step_idx == 0:
+                edges_path = Path(debug_path).parent / f"{Path(debug_path).stem}_edges.png"
+                placed_centers = [(col, row, int(round(cx)), int(round(cy)))
+                                  for (col, row), (cx, cy) in position_grid.items()]
+                save_debug_edges(debug_img, img_array, placed_centers, cell_w, cell_h, edges_path)
+
+    # Any remaining cells (shouldn't happen, but safety)
+    for col, row, orig_cx, orig_cy in centers:
+        if (col, row) not in position_grid:
+            position_grid[(col, row)] = (orig_cx, orig_cy)
+
+    # Build final centers list (round only at the very end)
+    final_centers = []
+    for col, row, orig_cx, orig_cy in centers:
+        cx, cy = position_grid[(col, row)]
+        final_centers.append((col, row, int(round(cx)), int(round(cy))))
+
+    return final_centers
+
+
+def find_best_grid(img_array: np.ndarray, min_period: int = 3, max_period: int | None = None) -> tuple[int, int, float, float]:
     """
     Find the best grid by optimizing cell size AND offset.
     Returns (n_cols, n_rows, offset_x, offset_y).
     """
     height, width = img_array.shape[:2]
+
+    # Default max_period to 1/10th of smallest dimension (pixel art cells shouldn't be huge)
+    if max_period is None:
+        max_period = max(20, min(width, height) // 10)
 
     h_edges = compute_edge_signal(img_array, axis=0)  # horizontal edges -> rows
     v_edges = compute_edge_signal(img_array, axis=1)  # vertical edges -> cols
@@ -737,12 +1295,68 @@ def save_debug_centers(
     debug_img.save(output_path)
 
 
+def save_debug_edges(
+    img: Image.Image,
+    img_array: np.ndarray,
+    centers: list[tuple[int, int, int, int]],  # (col, row, cx, cy)
+    cell_w: float,
+    cell_h: float,
+    output_path: str | Path,
+) -> None:
+    """Save image with detected edge midpoints drawn as purple lines."""
+    from PIL import ImageDraw
+    debug_img = img.copy().convert("RGBA")
+    draw = ImageDraw.Draw(debug_img)
+
+    height, width = img_array.shape[:2]
+    max_dist = int(max(cell_w, cell_h) * 0.8)
+
+    for col, row, cx, cy in centers:
+        # Get center color
+        if len(img_array.shape) == 3:
+            center_color = img_array[cy, cx, :3].astype(float)
+        else:
+            center_color = np.array([img_array[cy, cx]]).astype(float)
+
+        # Find edges in all 4 directions
+        left = find_edge_bounds(img_array, cx, cy, -1, 0, center_color, max_dist)
+        right = find_edge_bounds(img_array, cx, cy, 1, 0, center_color, max_dist)
+        up = find_edge_bounds(img_array, cx, cy, 0, -1, center_color, max_dist)
+        down = find_edge_bounds(img_array, cx, cy, 0, 1, center_color, max_dist)
+
+        purple = (180, 0, 255, 200)
+        line_len = int(cell_h * 0.4)
+
+        # Draw vertical lines at left/right edges
+        if left[0] is not None:
+            edge_x = cx - (left[0] + left[1]) / 2
+            draw.line([(edge_x, cy - line_len), (edge_x, cy + line_len)], fill=purple, width=1)
+        if right[0] is not None:
+            edge_x = cx + (right[0] + right[1]) / 2
+            draw.line([(edge_x, cy - line_len), (edge_x, cy + line_len)], fill=purple, width=1)
+
+        # Draw horizontal lines at up/down edges
+        line_len = int(cell_w * 0.4)
+        if up[0] is not None:
+            edge_y = cy - (up[0] + up[1]) / 2
+            draw.line([(cx - line_len, edge_y), (cx + line_len, edge_y)], fill=purple, width=1)
+        if down[0] is not None:
+            edge_y = cy + (down[0] + down[1]) / 2
+            draw.line([(cx - line_len, edge_y), (cx + line_len, edge_y)], fill=purple, width=1)
+
+        # Draw center as red dot
+        draw.ellipse([(cx - 1, cy - 1), (cx + 1, cy + 1)], fill=(255, 0, 0, 255))
+
+    debug_img.save(output_path)
+
+
 def extract_pixel_art(
     input_path: str | Path,
     output_path: str | Path | None = None,
     verbose: bool = True,
     debug: bool = False,
-) -> Image.Image:
+    pass0_only: bool = False,
+) -> Image.Image | None:
     """
     Extract clean pixel art from an upscaled pixel art image.
 
@@ -771,7 +1385,7 @@ def extract_pixel_art(
     out_width = n_cols
     out_height = n_rows
 
-    # Use strict grid centers with offset
+    # Compute initial grid centers
     centers = []
     for row in range(n_rows):
         for col in range(n_cols):
@@ -784,12 +1398,42 @@ def extract_pixel_art(
 
             centers.append((col, row, cx, cy))
 
-    # Save pass0: debug overlay showing detected grid centers
+    # Refine centers locally to find optimal positions
+    debug_path_for_refine = None
     if debug and output_path:
+        debug_path_for_refine = Path(output_path).parent / f"{Path(output_path).stem}_pass0.png"
+    centers = refine_centers_locally(
+        img_array, centers, cell_w, cell_h,
+        debug_path=debug_path_for_refine,
+        debug_img=img if debug else None,
+    )
+
+    if verbose:
+        # Count how many centers moved
+        initial_centers = []
+        for row in range(n_rows):
+            for col in range(n_cols):
+                cx = int(offset_x + (col + 0.5) * cell_w)
+                cy = int(offset_y + (row + 0.5) * cell_h)
+                cx = max(0, min(img.size[0] - 1, cx))
+                cy = max(0, min(img.size[1] - 1, cy))
+                initial_centers.append((cx, cy))
+
+        moved = sum(1 for (_, _, cx, cy), (icx, icy) in zip(centers, initial_centers)
+                    if cx != icx or cy != icy)
+        print(f"Refined {moved}/{len(centers)} centers locally")
+
+    # Save pass0: debug overlay showing detected grid centers
+    if (debug or pass0_only) and output_path:
         pass0_path = Path(output_path).parent / f"{Path(output_path).stem}_pass0.png"
         save_debug_centers(img, [(c[2], c[3]) for c in centers], pass0_path)
         if verbose:
             print(f"Pass 0 (grid centers) saved to: {pass0_path}")
+
+    if pass0_only:
+        if verbose:
+            print("Stopping after pass0 (--pass0-only)")
+        return None
 
     if out_width <= 0 or out_height <= 0:
         raise ValueError("Could not detect valid pixel grid.")
@@ -893,6 +1537,7 @@ def main() -> None:
     parser.add_argument("-o", "--output", help="Output image path (default: input_pixels.png)")
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress output")
     parser.add_argument("--debug", action="store_true", help="Save debug image with detected centers")
+    parser.add_argument("--pass0-only", action="store_true", help="Stop after pass0 (grid detection only)")
 
     args = parser.parse_args()
 
@@ -906,6 +1551,7 @@ def main() -> None:
         args.output,
         verbose=not args.quiet,
         debug=args.debug,
+        pass0_only=args.pass0_only,
     )
 
 
