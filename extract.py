@@ -172,6 +172,77 @@ def extract_palette(
     return [(r, g, b, 255) for r, g, b in best_palette]
 
 
+def compute_palette_quality(
+    colors: list[tuple[int, int, int]],
+    palette: list[tuple[int, int, int]],
+    soft_threshold: float,
+) -> tuple[float, float]:
+    """
+    Compute palette quality metrics.
+    Returns (deviation_rate, max_error) where:
+    - deviation_rate: fraction of colors beyond soft_threshold
+    - max_error: maximum distance of any color to its nearest palette color
+    """
+    if not colors or not palette:
+        return 1.0, float('inf')
+    deviating = 0
+    max_err = 0.0
+    for c in colors:
+        min_dist = min(color_distance(c, p) for p in palette)
+        if min_dist > soft_threshold:
+            deviating += 1
+        max_err = max(max_err, min_dist)
+    return deviating / len(colors), max_err
+
+
+def extract_palette_quality(
+    colors: list[tuple[int, int, int, int]],
+    max_deviation: float = 20.0,  # Target: smallest palette where max_err <= this
+    verbose: bool = False,
+) -> list[tuple[int, int, int, int]]:
+    """
+    Find smallest palette where max deviation is under threshold.
+
+    Tries all palette sizes linearly to handle non-monotonic quality
+    (where N+1 colors might be worse than N due to different clustering).
+    """
+    unique_rgb = list(set((r, g, b) for r, g, b, a in colors))
+    all_rgb = [(r, g, b) for r, g, b, a in colors]
+
+    if verbose:
+        print(f"  {len(unique_rgb)} unique colors from {len(colors)} samples")
+
+    if len(unique_rgb) <= 2:
+        return [(r, g, b, 255) for r, g, b in unique_rgb]
+
+    # Compute all palette sizes first
+    min_size, max_size = 10, min(80, len(unique_rgb))
+    all_results = []  # (size, palette, max_err)
+
+    for n in range(min_size, max_size + 1):
+        palette = quantize_to_n_colors(unique_rgb, n)
+        _, max_err = compute_palette_quality(all_rgb, palette, soft_threshold=0)
+        all_results.append((n, palette, max_err))
+
+        if verbose:
+            marker = "✓" if max_err <= max_deviation else ""
+            print(f"  {n} colors: max_err={max_err:.1f} {marker}")
+
+    # Pick smallest palette that meets threshold
+    valid = [(n, p, e) for n, p, e in all_results if e <= max_deviation]
+
+    if valid:
+        best_size, best_palette, best_err = min(valid, key=lambda x: x[0])
+        if verbose:
+            print(f"  Selected: {best_size} colors (max_err={best_err:.1f})")
+        return [(r, g, b, 255) for r, g, b in best_palette]
+
+    # Nothing met threshold - use largest
+    if verbose:
+        print(f"  Warning: no palette met threshold {max_deviation}, using max size")
+    return [(r, g, b, 255) for r, g, b in all_results[-1][1]]
+
+
 def snap_to_palette(color: tuple[int, int, int, int], palette: list[tuple[int, int, int, int]]) -> tuple[int, int, int, int]:
     """Find the nearest palette color using perceptual distance."""
     best_dist = float('inf')
@@ -713,12 +784,12 @@ def extract_pixel_art(
 
             centers.append((col, row, cx, cy))
 
-    # Save debug overlay if requested
+    # Save pass0: debug overlay showing detected grid centers
     if debug and output_path:
-        debug_path = Path(output_path).parent / f"{Path(output_path).stem}_centers.png"
-        save_debug_centers(img, [(c[2], c[3]) for c in centers], debug_path)
+        pass0_path = Path(output_path).parent / f"{Path(output_path).stem}_pass0.png"
+        save_debug_centers(img, [(c[2], c[3]) for c in centers], pass0_path)
         if verbose:
-            print(f"Debug centers saved to: {debug_path}")
+            print(f"Pass 0 (grid centers) saved to: {pass0_path}")
 
     if out_width <= 0 or out_height <= 0:
         raise ValueError("Could not detect valid pixel grid.")
@@ -729,32 +800,41 @@ def extract_pixel_art(
     # Create output image
     output = Image.new("RGBA", (out_width, out_height))
 
-    # First pass: sample colors from small region around center, pick most common
+    # Pass 1: Sample inner 50-80% of each cell and take average (ignoring outliers)
+    # This gives us the "true" color for each pixel before palette reduction
     sampled_colors = []
-    sample_radius = max(1, int(min(cell_w, cell_h) * 0.2))  # 20% of cell size
+    inner_fraction = 0.6  # Sample inner 60% of cell (30% margin on each side)
+    inner_radius_w = max(1, int(cell_w * inner_fraction / 2))
+    inner_radius_h = max(1, int(cell_h * inner_fraction / 2))
 
     for col, row, cx, cy in centers:
-        # Sample a small region
-        x1 = max(0, cx - sample_radius)
-        x2 = min(img.size[0], cx + sample_radius + 1)
-        y1 = max(0, cy - sample_radius)
-        y2 = min(img.size[1], cy + sample_radius + 1)
+        # Sample inner region of the cell
+        x1 = max(0, cx - inner_radius_w)
+        x2 = min(img.size[0], cx + inner_radius_w + 1)
+        y1 = max(0, cy - inner_radius_h)
+        y2 = min(img.size[1], cy + inner_radius_h + 1)
 
         region = img_array[y1:y2, x1:x2]
 
-        if region.size > 0:
-            # Flatten to list of colors and find most common
-            pixels = region.reshape(-1, region.shape[-1]) if len(region.shape) == 3 else region.reshape(-1, 1)
+        if region.size > 0 and len(region.shape) == 3:
+            # Flatten to list of RGB values
+            pixels = region.reshape(-1, region.shape[-1])[:, :3].astype(float)
 
-            # Convert to tuples for counting
-            from collections import Counter
-            if pixels.shape[1] >= 3:
-                color_tuples = [tuple(p[:3]) for p in pixels]
+            if len(pixels) >= 4:
+                # Remove outliers using IQR on color distance from median
+                median_color = np.median(pixels, axis=0)
+                distances = np.sqrt(np.sum((pixels - median_color) ** 2, axis=1))
+                q1, q3 = np.percentile(distances, [25, 75])
+                iqr = q3 - q1
+                mask = distances <= q3 + 1.5 * iqr
+                filtered = pixels[mask] if np.sum(mask) > 0 else pixels
+
+                # Take mean of filtered pixels
+                mean_color = np.mean(filtered, axis=0)
             else:
-                color_tuples = [(int(p[0]), int(p[0]), int(p[0])) for p in pixels]
+                mean_color = np.mean(pixels, axis=0)
 
-            most_common = Counter(color_tuples).most_common(1)[0][0]
-            color = (most_common[0], most_common[1], most_common[2], 255)
+            color = (int(mean_color[0]), int(mean_color[1]), int(mean_color[2]), 255)
         else:
             pixel = img_array[cy, cx]
             if len(pixel) >= 3:
@@ -764,9 +844,21 @@ def extract_pixel_art(
 
         sampled_colors.append((col, row, color))
 
-    # Extract palette and snap colors
+    # Create pass1 image (true colors before palette reduction)
+    pass1_image = Image.new("RGBA", (out_width, out_height))
+    for col, row, color in sampled_colors:
+        pass1_image.putpixel((col, row), color)
+
+    # Save pass1: max palette (true colors before reduction)
+    if debug and output_path:
+        pass1_path = Path(output_path).parent / f"{Path(output_path).stem}_pass1.png"
+        pass1_image.save(pass1_path)
+        if verbose:
+            print(f"Pass 1 (max palette) saved to: {pass1_path}")
+
+    # Extract palette using new quality metric
     all_colors = [c[2] for c in sampled_colors]
-    palette = extract_palette(all_colors, verbose=verbose)
+    palette = extract_palette_quality(all_colors, verbose=verbose)
 
     if verbose:
         print(f"Palette: {len(palette)} colors")
@@ -774,15 +866,13 @@ def extract_pixel_art(
         hex_colors = ['#' + ''.join(f'{c:02x}' for c in p[:3]) for p in palette]
         print(f"  Colors: {', '.join(hex_colors)}")
 
-    # First pass: snap all colors to palette
+    # Snap all colors to palette
     snapped_grid = {}
-    original_grid = {}
     for col, row, color in sampled_colors:
         snapped = snap_to_palette(color, palette)
         snapped_grid[(col, row)] = snapped
-        original_grid[(col, row)] = color
 
-    # Write to output (no spatial smoothing for now)
+    # Write to output
     for (col, row), snapped in snapped_grid.items():
         output.putpixel((col, row), snapped)
 
