@@ -195,17 +195,154 @@ def compute_palette_quality(
     return deviating / len(colors), max_err
 
 
+def precluster_colors_spatial(
+    sampled_colors: list[tuple[int, int, tuple[int, int, int, int]]],
+    neighbor_threshold: float = 8.0,
+    chain_threshold: float = 12.0,
+) -> list[tuple[int, int, tuple[int, int, int, int]]]:
+    """
+    Walk the image spatially and build chains of similar adjacent pixels.
+    Each pixel must be close to its neighbor AND not too far from chain average.
+
+    Args:
+        sampled_colors: List of (col, row, color) tuples
+        neighbor_threshold: Max distance between adjacent pixels to chain
+        chain_threshold: Max distance from chain average to join
+
+    Returns:
+        List of (col, row, unified_color) where unified_color is chain representative
+    """
+    # Build lookup by position
+    color_grid = {(col, row): color for col, row, color in sampled_colors}
+    max_col = max(col for col, row, _ in sampled_colors)
+    max_row = max(row for col, row, _ in sampled_colors)
+
+    # Track which pixels are assigned to chains
+    chain_id = {}  # (col, row) -> chain index
+    chains = []  # List of [(col, row), ...] for each chain
+    chain_colors = []  # Running average color for each chain
+
+    def get_rgb(color):
+        return (color[0], color[1], color[2])
+
+    def rgb_avg(colors_list):
+        if not colors_list:
+            return (0, 0, 0)
+        r = sum(c[0] for c in colors_list) // len(colors_list)
+        g = sum(c[1] for c in colors_list) // len(colors_list)
+        b = sum(c[2] for c in colors_list) // len(colors_list)
+        return (r, g, b)
+
+    # Process pixels in scan order
+    for row in range(max_row + 1):
+        for col in range(max_col + 1):
+            if (col, row) not in color_grid:
+                continue
+
+            color = color_grid[(col, row)]
+            rgb = get_rgb(color)
+
+            # Check neighbors (left and up, since we scan left-to-right, top-to-bottom)
+            best_chain = None
+            best_dist = float('inf')
+
+            for dc, dr in [(-1, -1), (0, -1), (1, -1), (-1, 0), (1, 0), (-1, 1), (0, 1), (1, 1)]:
+                nc, nr = col + dc, row + dr
+                if (nc, nr) in chain_id:
+                    neighbor_color = color_grid[(nc, nr)]
+                    neighbor_rgb = get_rgb(neighbor_color)
+                    cid = chain_id[(nc, nr)]
+                    chain_avg = chain_colors[cid]
+
+                    # Check both: close to neighbor AND close to chain average
+                    neighbor_dist = color_distance(rgb, neighbor_rgb)
+                    chain_dist = color_distance(rgb, chain_avg)
+
+                    if neighbor_dist < neighbor_threshold and chain_dist < chain_threshold:
+                        if neighbor_dist < best_dist:
+                            best_dist = neighbor_dist
+                            best_chain = cid
+
+            if best_chain is not None:
+                # Join existing chain
+                chain_id[(col, row)] = best_chain
+                chains[best_chain].append((col, row))
+                # Update running average
+                chain_rgbs = [get_rgb(color_grid[pos]) for pos in chains[best_chain]]
+                chain_colors[best_chain] = rgb_avg(chain_rgbs)
+            else:
+                # Start new chain
+                new_id = len(chains)
+                chain_id[(col, row)] = new_id
+                chains.append([(col, row)])
+                chain_colors.append(rgb)
+
+    # Merge chains with similar colors
+    merge_threshold = chain_threshold * 0.8  # Slightly tighter than chain threshold
+    chain_map = list(range(len(chains)))  # chain_map[i] = canonical chain for i
+
+    def find_canonical(i):
+        while chain_map[i] != i:
+            i = chain_map[i]
+        return i
+
+    for i in range(len(chains)):
+        for j in range(i + 1, len(chains)):
+            ci, cj = find_canonical(i), find_canonical(j)
+            if ci != cj:
+                dist = color_distance(chain_colors[ci], chain_colors[cj])
+                if dist < merge_threshold:
+                    # Merge j into i
+                    chain_map[cj] = ci
+
+    # Compute merged colors (average of merged chains)
+    merged_colors = {}
+    for i in range(len(chains)):
+        ci = find_canonical(i)
+        if ci not in merged_colors:
+            # Find all chains that merge to this one
+            member_chains = [j for j in range(len(chains)) if find_canonical(j) == ci]
+            # Average their colors weighted by chain size
+            total_pixels = sum(len(chains[j]) for j in member_chains)
+            r = sum(chain_colors[j][0] * len(chains[j]) for j in member_chains) // total_pixels
+            g = sum(chain_colors[j][1] * len(chains[j]) for j in member_chains) // total_pixels
+            b = sum(chain_colors[j][2] * len(chains[j]) for j in member_chains) // total_pixels
+            merged_colors[ci] = (r, g, b)
+
+    # Build result with unified colors
+    result = []
+    for col, row, color in sampled_colors:
+        if (col, row) in chain_id:
+            cid = chain_id[(col, row)]
+            canonical = find_canonical(cid)
+            avg = merged_colors[canonical]
+            result.append((col, row, (avg[0], avg[1], avg[2], color[3])))
+        else:
+            result.append((col, row, color))
+
+    return result
+
+
 def extract_palette_quality(
     colors: list[tuple[int, int, int, int]],
-    max_deviation: float = 20.0,  # Target: smallest palette where max_err <= this
+    max_deviation: float = 12.0,  # No pixel should differ more than this
+    soft_threshold: float = 5.0,  # Threshold for "noticeable" deviation
+    max_deviation_rate: float = 0.05,  # Max 5% of pixels can exceed soft_threshold
+    precluster_threshold: float = 15.0,  # Merge colors within this distance first
     verbose: bool = False,
 ) -> list[tuple[int, int, int, int]]:
     """
-    Find smallest palette where max deviation is under threshold.
+    Find smallest palette where:
+    1. No pixel differs by more than max_deviation (hard limit)
+    2. At most max_deviation_rate of pixels differ by more than soft_threshold
 
     Tries all palette sizes linearly to handle non-monotonic quality
     (where N+1 colors might be worse than N due to different clustering).
     """
+    # Pre-cluster to reduce AI noise
+    if precluster_threshold > 0:
+        colors = precluster_colors(colors, precluster_threshold)
+
     unique_rgb = list(set((r, g, b) for r, g, b, a in colors))
     all_rgb = [(r, g, b) for r, g, b, a in colors]
 
@@ -217,24 +354,35 @@ def extract_palette_quality(
 
     # Compute all palette sizes first
     min_size, max_size = 10, min(80, len(unique_rgb))
-    all_results = []  # (size, palette, max_err)
+    all_results = []  # (size, palette, dev_rate, max_err)
 
     for n in range(min_size, max_size + 1):
         palette = quantize_to_n_colors(unique_rgb, n)
-        _, max_err = compute_palette_quality(all_rgb, palette, soft_threshold=0)
-        all_results.append((n, palette, max_err))
+        dev_rate, max_err = compute_palette_quality(all_rgb, palette, soft_threshold=soft_threshold)
+        all_results.append((n, palette, dev_rate, max_err))
 
         if verbose:
-            marker = "✓" if max_err <= max_deviation else ""
-            print(f"  {n} colors: max_err={max_err:.1f} {marker}")
+            passes_max = max_err <= max_deviation
+            passes_rate = dev_rate <= max_deviation_rate
+            marker = "✓" if (passes_max and passes_rate) else ""
+            print(f"  {n} colors: max_err={max_err:.1f}, dev_rate={dev_rate:.1%} {marker}")
 
-    # Pick smallest palette that meets threshold
-    valid = [(n, p, e) for n, p, e in all_results if e <= max_deviation]
+    # Pick smallest palette that meets both thresholds
+    valid = [(n, p, dr, e) for n, p, dr, e in all_results
+             if e <= max_deviation and dr <= max_deviation_rate]
 
     if valid:
-        best_size, best_palette, best_err = min(valid, key=lambda x: x[0])
+        best_size, best_palette, best_dr, best_err = min(valid, key=lambda x: x[0])
         if verbose:
-            print(f"  Selected: {best_size} colors (max_err={best_err:.1f})")
+            print(f"  Selected: {best_size} colors (max_err={best_err:.1f}, dev_rate={best_dr:.1%})")
+        return [(r, g, b, 255) for r, g, b in best_palette]
+
+    # Nothing met both thresholds - try just max_err
+    valid_max = [(n, p, dr, e) for n, p, dr, e in all_results if e <= max_deviation]
+    if valid_max:
+        best_size, best_palette, best_dr, best_err = min(valid_max, key=lambda x: x[0])
+        if verbose:
+            print(f"  Selected: {best_size} colors (max_err={best_err:.1f}, dev_rate={best_dr:.1%} - rate exceeded)")
         return [(r, g, b, 255) for r, g, b in best_palette]
 
     # Nothing met threshold - use largest
@@ -1425,7 +1573,7 @@ def extract_pixel_art(
         print(f"Refined {moved}/{len(centers)} centers locally")
 
     # Save pass0: debug overlay showing detected grid centers
-    if (debug or pass0_only) and output_path:
+    if output_path:
         pass0_path = Path(output_path).parent / f"{Path(output_path).stem}_pass0.png"
         save_debug_centers(img, [(c[2], c[3]) for c in centers], pass0_path)
         if verbose:
@@ -1506,9 +1654,17 @@ def extract_pixel_art(
             print("Stopping after pass1 (--pass1-only)")
         return pass1_image
 
+    # Spatial pre-clustering: chain similar adjacent pixels
+    if verbose:
+        print("Spatial clustering...")
+    sampled_colors = precluster_colors_spatial(sampled_colors)
+    if verbose:
+        unique_after = len(set(c[2][:3] for c in sampled_colors))
+        print(f"  {unique_after} unique colors after spatial clustering")
+
     # Extract palette using new quality metric
     all_colors = [c[2] for c in sampled_colors]
-    palette = extract_palette_quality(all_colors, verbose=verbose)
+    palette = extract_palette_quality(all_colors, precluster_threshold=0, verbose=verbose)
 
     if verbose:
         print(f"Palette: {len(palette)} colors")
@@ -1521,6 +1677,123 @@ def extract_pixel_art(
     for col, row, color in sampled_colors:
         snapped = snap_to_palette(color, palette)
         snapped_grid[(col, row)] = snapped
+
+    # Clean up rare colors: if a palette color is used < N times,
+    # replace with nearest other palette color if within threshold
+    min_color_count = 3  # Colors used less than this many times
+    rare_color_threshold = 25.0  # Only merge if nearest color is within this distance
+
+    color_counts = {}
+    for color in snapped_grid.values():
+        color_counts[color] = color_counts.get(color, 0) + 1
+
+    rare_colors = {c for c, count in color_counts.items() if count < min_color_count}
+
+    if rare_colors and verbose:
+        print(f"  Found {len(rare_colors)} rare colors (used <{min_color_count} times)")
+
+    # Build mapping for rare colors to their nearest non-rare palette color
+    rare_mapping = {}
+    for rare in rare_colors:
+        best_dist = float('inf')
+        best_color = rare
+        for other in palette:
+            other_tuple = tuple(other)
+            if other_tuple not in rare_colors and other_tuple != rare:
+                dist = color_distance(rare[:3], other[:3])
+                if dist < best_dist:
+                    best_dist = dist
+                    best_color = other_tuple
+        if best_dist <= rare_color_threshold:
+            rare_mapping[rare] = best_color
+
+    if rare_mapping and verbose:
+        print(f"  Merging {len(rare_mapping)} rare colors into nearby palette colors")
+
+    # Apply rare color mapping
+    for pos, color in snapped_grid.items():
+        if color in rare_mapping:
+            snapped_grid[pos] = rare_mapping[color]
+
+    # Local smoothing: if a pixel has a very similar neighbor, use the more common color in 3x3 block
+    similar_neighbor_threshold = 12.0  # Colors within this distance are "super close"
+    smoothed = 0
+
+    for (col, row), color in list(snapped_grid.items()):
+        # Get 3x3 neighborhood colors
+        neighbors = []
+        for dc in [-1, 0, 1]:
+            for dr in [-1, 0, 1]:
+                nc, nr = col + dc, row + dr
+                if (nc, nr) in snapped_grid:
+                    neighbors.append(snapped_grid[(nc, nr)])
+
+        # Check if any neighbor is super close to this pixel's color
+        has_similar = False
+        for n in neighbors:
+            if n != color and color_distance(color[:3], n[:3]) < similar_neighbor_threshold:
+                has_similar = True
+                break
+
+        if has_similar:
+            # Count colors in 3x3 block
+            local_counts = {}
+            for n in neighbors:
+                local_counts[n] = local_counts.get(n, 0) + 1
+
+            # Find the most common color that's similar to current
+            best_color = color
+            best_count = local_counts.get(color, 0)
+            for c, count in local_counts.items():
+                if count > best_count and color_distance(color[:3], c[:3]) < similar_neighbor_threshold:
+                    best_color = c
+                    best_count = count
+
+            if best_color != color:
+                snapped_grid[(col, row)] = best_color
+                smoothed += 1
+
+    if smoothed and verbose:
+        print(f"  Smoothed {smoothed} pixels to match local neighbors")
+
+    # Remove unused colors from palette
+    used_colors = set(snapped_grid.values())
+    palette = [c for c in palette if tuple(c) in used_colors]
+
+    # Merge similar palette colors globally
+    palette_merge_threshold = 15.0
+    palette_list = [tuple(c) for c in palette]
+    merged_palette_map = {}  # old color -> new color
+
+    # Sort by usage count (most used first) to keep the dominant color
+    palette_usage = {c: sum(1 for v in snapped_grid.values() if v == c) for c in palette_list}
+    palette_list.sort(key=lambda c: palette_usage[c], reverse=True)
+
+    final_palette = []
+    for color in palette_list:
+        # Check if this color should merge into an existing final palette color
+        merged = False
+        for existing in final_palette:
+            if color_distance(color[:3], existing[:3]) < palette_merge_threshold:
+                merged_palette_map[color] = existing
+                merged = True
+                break
+        if not merged:
+            final_palette.append(color)
+            merged_palette_map[color] = color
+
+    if len(final_palette) < len(palette_list) and verbose:
+        print(f"  Merged {len(palette_list) - len(final_palette)} similar palette colors")
+
+    # Re-snap pixels to merged palette
+    for pos, color in snapped_grid.items():
+        if color in merged_palette_map:
+            snapped_grid[pos] = merged_palette_map[color]
+
+    palette = list(final_palette)
+
+    if verbose:
+        print(f"  Final palette: {len(palette)} colors")
 
     # Write to output
     for (col, row), snapped in snapped_grid.items():
