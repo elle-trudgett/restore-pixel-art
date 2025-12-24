@@ -1071,7 +1071,7 @@ def refine_centers_locally(
     # Start with top 10%, then 20%, 30%, etc.
     position_grid = {}  # (col, row) -> (cx, cy) once placed
 
-    percentile_steps = [98]  # Focus on highest confidence first
+    percentile_steps = [98, 95, 90, 80, 60, 25, 0]
 
     for step_idx, percentile in enumerate(percentile_steps):
         conf_threshold = np.percentile(all_conf, percentile) if percentile > 0 else -1
@@ -1356,6 +1356,7 @@ def extract_pixel_art(
     verbose: bool = True,
     debug: bool = False,
     pass0_only: bool = False,
+    pass1_only: bool = False,
 ) -> Image.Image | None:
     """
     Extract clean pixel art from an upscaled pixel art image.
@@ -1493,12 +1494,17 @@ def extract_pixel_art(
     for col, row, color in sampled_colors:
         pass1_image.putpixel((col, row), color)
 
-    # Save pass1: max palette (true colors before reduction)
-    if debug and output_path:
+    # Save pass1: true colors before palette reduction
+    if output_path:
         pass1_path = Path(output_path).parent / f"{Path(output_path).stem}_pass1.png"
         pass1_image.save(pass1_path)
         if verbose:
-            print(f"Pass 1 (max palette) saved to: {pass1_path}")
+            print(f"Pass 1 (true colors) saved to: {pass1_path}")
+
+    if pass1_only:
+        if verbose:
+            print("Stopping after pass1 (--pass1-only)")
+        return pass1_image
 
     # Extract palette using new quality metric
     all_colors = [c[2] for c in sampled_colors]
@@ -1538,6 +1544,7 @@ def main() -> None:
     parser.add_argument("-q", "--quiet", action="store_true", help="Suppress output")
     parser.add_argument("--debug", action="store_true", help="Save debug image with detected centers")
     parser.add_argument("--pass0-only", action="store_true", help="Stop after pass0 (grid detection only)")
+    parser.add_argument("--pass1-only", action="store_true", help="Stop after pass1 (true colors, no palette reduction)")
 
     args = parser.parse_args()
 
@@ -1552,6 +1559,7 @@ def main() -> None:
         verbose=not args.quiet,
         debug=args.debug,
         pass0_only=args.pass0_only,
+        pass1_only=args.pass1_only,
     )
 
 
