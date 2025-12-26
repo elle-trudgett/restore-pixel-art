@@ -512,22 +512,24 @@ def find_period_autocorr(signal: np.ndarray, min_period: int = 3, max_period: in
     autocorr = autocorr[n-1:]  # Take positive lags only
 
     # Find peaks in autocorrelation (excluding lag 0)
+    # Prefer smaller periods - only switch to larger if significantly better (10%+)
     best_period = min_period
     best_score = 0
 
     for period in range(min_period, min(max_period + 1, n // 2)):
         score = autocorr[period]
-        if score > best_score:
+        # Require 10% improvement to prefer a larger period (avoids harmonics)
+        if score > best_score * 1.1:
             best_score = score
             best_period = period
 
     return best_period
 
 
-def find_best_grid(img_array: np.ndarray, min_period: int = 3, max_period: int | None = None) -> tuple[int, int, float, float]:
+def find_best_grid(img_array: np.ndarray, min_period: int = 3, max_period: int | None = None) -> tuple[int, int, float, float, float, float, int, int]:
     """
     Find the best grid by optimizing cell size AND offset.
-    Returns (n_cols, n_rows, offset_x, offset_y).
+    Returns (n_cols, n_rows, offset_x, offset_y, cell_w, cell_h, start_partial_x, start_partial_y).
     """
     height, width = img_array.shape[:2]
 
@@ -573,10 +575,24 @@ def find_best_grid(img_array: np.ndarray, min_period: int = 3, max_period: int |
 
     cell_w, cell_h, offset_x, offset_y = best_cw, best_ch, best_ox, best_oy
 
-    n_cols = int((width - offset_x) / cell_w) + (1 if offset_x > 0 else 0)
-    n_rows = int((height - offset_y) / cell_h) + (1 if offset_y > 0 else 0)
+    # Count full cells plus partial cells at start/end if > half a cell
+    n_full_cols = int((width - offset_x) / cell_w)
+    n_full_rows = int((height - offset_y) / cell_h)
 
-    return max(1, n_cols), max(1, n_rows), offset_x, offset_y, cell_w, cell_h
+    # Partial cell at start (from 0 to offset)
+    start_partial_x = 1 if offset_x > cell_w * 0.5 else 0
+    start_partial_y = 1 if offset_y > cell_h * 0.5 else 0
+
+    # Partial cell at end (remainder after last full cell)
+    end_remainder_x = (width - offset_x) - n_full_cols * cell_w
+    end_remainder_y = (height - offset_y) - n_full_rows * cell_h
+    end_partial_x = 1 if end_remainder_x > cell_w * 0.5 else 0
+    end_partial_y = 1 if end_remainder_y > cell_h * 0.5 else 0
+
+    n_cols = start_partial_x + n_full_cols + end_partial_x
+    n_rows = start_partial_y + n_full_rows + end_partial_y
+
+    return max(1, n_cols), max(1, n_rows), offset_x, offset_y, cell_w, cell_h, start_partial_x, start_partial_y
 
 
 def save_debug_centers(
@@ -628,7 +644,7 @@ def extract_pixel_art(
 
     # Quick grid detection to check cell size
     img_array = np.array(img)
-    n_cols, n_rows, offset_x, offset_y, cell_w, cell_h = find_best_grid(img_array)
+    n_cols, n_rows, offset_x, offset_y, cell_w, cell_h, start_partial_x, start_partial_y = find_best_grid(img_array)
     avg_cell = (cell_w + cell_h) / 2
 
     while avg_cell < min_cell_size and scale_factor < 16:
@@ -636,7 +652,7 @@ def extract_pixel_art(
         new_size = (img.size[0] * scale_factor, img.size[1] * scale_factor)
         scaled_img = img.resize(new_size, Image.Resampling.NEAREST)
         img_array = np.array(scaled_img)
-        n_cols, n_rows, offset_x, offset_y, cell_w, cell_h = find_best_grid(img_array)
+        n_cols, n_rows, offset_x, offset_y, cell_w, cell_h, start_partial_x, start_partial_y = find_best_grid(img_array)
         avg_cell = (cell_w + cell_h) / 2
 
     while avg_cell > max_cell_size and scale_factor > 0.125:
@@ -644,7 +660,7 @@ def extract_pixel_art(
         new_size = (int(img.size[0] * scale_factor), int(img.size[1] * scale_factor))
         scaled_img = img.resize(new_size, Image.Resampling.LANCZOS)
         img_array = np.array(scaled_img)
-        n_cols, n_rows, offset_x, offset_y, cell_w, cell_h = find_best_grid(img_array)
+        n_cols, n_rows, offset_x, offset_y, cell_w, cell_h, start_partial_x, start_partial_y = find_best_grid(img_array)
         avg_cell = (cell_w + cell_h) / 2
 
     if scale_factor != 1:
@@ -707,8 +723,19 @@ def extract_pixel_art(
     centers = []
     for row in range(n_rows):
         for col in range(n_cols):
-            cx = int(offset_x + (col + 0.5) * cell_w)
-            cy = int(offset_y + (row + 0.5) * cell_h)
+            # Handle partial cells at start
+            if start_partial_x and col == 0:
+                cx = int(offset_x / 2)  # Center of partial cell at start
+            else:
+                # Adjust col index if there's a start partial
+                adj_col = col - start_partial_x
+                cx = int(offset_x + (adj_col + 0.5) * cell_w)
+
+            if start_partial_y and row == 0:
+                cy = int(offset_y / 2)  # Center of partial cell at start
+            else:
+                adj_row = row - start_partial_y
+                cy = int(offset_y + (adj_row + 0.5) * cell_h)
 
             # Clamp to image bounds
             cx = max(0, min(working_img.size[0] - 1, cx))
