@@ -173,7 +173,8 @@ fn score_grid_alignment(edge_signal: &[f64], cell_size: f64, offset: f64) -> f64
         }
     }
 
-    boundary_score - center_score * 0.5
+    // Normalize by n_cells to avoid bias toward smaller cell sizes
+    (boundary_score - center_score * 0.5) / n_cells as f64
 }
 
 struct GridResult {

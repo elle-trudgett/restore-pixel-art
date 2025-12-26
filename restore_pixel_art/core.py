@@ -496,7 +496,8 @@ def score_grid_alignment(edge_signal: np.ndarray, cell_size: float, offset: floa
             center_score += edge_signal[center]
 
     # Want high boundaries, low centers
-    return boundary_score - center_score * 0.5
+    # Normalize by n_cells to avoid bias toward smaller cell sizes
+    return (boundary_score - center_score * 0.5) / n_cells
 
 
 def find_period_autocorr(signal: np.ndarray, min_period: int = 3, max_period: int = 100) -> int:
