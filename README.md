@@ -32,11 +32,22 @@ Older AI generated pixel art:
 
 ## Installation
 
+### Python
+
 ```bash
 uv sync
 ```
 
+### Rust (recommended, ~66x faster)
+
+```bash
+cd restore_pixel_art_rs
+cargo build --release
+```
+
 ## Usage
+
+### Python
 
 ```bash
 # Basic usage
@@ -50,6 +61,15 @@ uv run restore-pixel-art input.png -o output.png --pass1-only
 
 # Full debug output
 uv run restore-pixel-art input.png -o output.png --debug
+```
+
+### Rust
+
+```bash
+./restore_pixel_art_rs/target/release/restore-pixel-art-rs input.png -o output.png
+
+# Quiet mode (suppress progress output)
+./restore_pixel_art_rs/target/release/restore-pixel-art-rs input.png -o output.png -q
 ```
 
 ## Output Files

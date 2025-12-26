@@ -845,6 +845,21 @@ def extract_pixel_art(
             print("Stopping after pass1 (--pass1-only)")
         return pass1_image
 
+    # Store original sampled colors as reference for max_deviation checks
+    original_colors = {(col, row): color for col, row, color in sampled_colors}
+    max_deviation = 12.0  # Strict limit for common/important colors
+    max_deviation_rare = 22.0  # Relaxed limit for rare colors (merge them away)
+
+    # We'll compute the rarity threshold after snapping to palette
+    rarity_threshold = 0  # Will be set later based on median usage
+
+    def is_valid_color(pos: tuple[int, int], new_color: tuple, is_rare: bool = False) -> bool:
+        """Check if new_color is within allowed deviation of original color at pos.
+        Rare colors get more tolerance since they're likely noise and should merge."""
+        orig = original_colors[pos]
+        effective_max = max_deviation_rare if is_rare else max_deviation
+        return color_distance(orig[:3], new_color[:3]) <= effective_max
+
     # Spatial pre-clustering: chain similar adjacent pixels
     if verbose:
         unique_before = len(set(c[2][:3] for c in sampled_colors))
@@ -853,6 +868,20 @@ def extract_pixel_art(
     if verbose:
         unique_after = len(set(c[2][:3] for c in sampled_colors))
         print(f"  {unique_after} unique colors after spatial clustering")
+
+    # Validate spatial clustering didn't exceed max_deviation (strict check)
+    valid_sampled = []
+    spatial_reverts = 0
+    for col, row, color in sampled_colors:
+        if is_valid_color((col, row), color, is_rare=False):
+            valid_sampled.append((col, row, color))
+        else:
+            # Revert to original color
+            valid_sampled.append((col, row, original_colors[(col, row)]))
+            spatial_reverts += 1
+    sampled_colors = valid_sampled
+    if spatial_reverts and verbose:
+        print(f"  Reverted {spatial_reverts} pixels that exceeded max_deviation")
 
     # Extract palette using new quality metric
     all_colors = [c[2] for c in sampled_colors]
@@ -870,19 +899,26 @@ def extract_pixel_art(
         snapped = snap_to_palette(color, palette)
         snapped_grid[(col, row)] = snapped
 
-    # Clean up rare colors: if a palette color is used < N times,
-    # replace with nearest other palette color if within threshold
-    min_color_count = 3  # Colors used less than this many times
-    rare_color_threshold = 25.0  # Only merge if nearest color is within this distance
-
+    # Compute rarity threshold based on median palette usage / 4
     color_counts = {}
     for color in snapped_grid.values():
         color_counts[color] = color_counts.get(color, 0) + 1
 
-    rare_colors = {c for c, count in color_counts.items() if count < min_color_count}
+    usage_values = sorted(color_counts.values())
+    median_usage = usage_values[len(usage_values) // 2] if usage_values else 10
+    rarity_threshold = max(3, median_usage // 4)  # At least 3, or median/4
+
+    if verbose:
+        print(f"  Rarity threshold: {rarity_threshold} (median usage: {median_usage})")
+
+    # Clean up rare colors: if a palette color is used < rarity_threshold times,
+    # replace with nearest other palette color (rare colors get relaxed deviation check)
+    rare_color_merge_threshold = 25.0  # Only merge if nearest color is within this distance
+
+    rare_colors = {c for c, count in color_counts.items() if count < rarity_threshold}
 
     if rare_colors and verbose:
-        print(f"  Found {len(rare_colors)} rare colors (used <{min_color_count} times)")
+        print(f"  Found {len(rare_colors)} rare colors (used <{rarity_threshold} times)")
 
     # Build mapping for rare colors to their nearest non-rare palette color
     rare_mapping = {}
@@ -896,16 +932,26 @@ def extract_pixel_art(
                 if dist < best_dist:
                     best_dist = dist
                     best_color = other_tuple
-        if best_dist <= rare_color_threshold:
+        if best_dist <= rare_color_merge_threshold:
             rare_mapping[rare] = best_color
 
     if rare_mapping and verbose:
         print(f"  Merging {len(rare_mapping)} rare colors into nearby palette colors")
 
-    # Apply rare color mapping
-    for pos, color in snapped_grid.items():
+    # Apply rare color mapping (with relaxed max_deviation check for rare colors)
+    rare_applied = 0
+    rare_blocked = 0
+    for pos, color in list(snapped_grid.items()):
         if color in rare_mapping:
-            snapped_grid[pos] = rare_mapping[color]
+            new_color = rare_mapping[color]
+            # Rare colors get relaxed threshold - we WANT to merge them away
+            if is_valid_color(pos, new_color, is_rare=True):
+                snapped_grid[pos] = new_color
+                rare_applied += 1
+            else:
+                rare_blocked += 1
+    if rare_blocked and verbose:
+        print(f"    Blocked {rare_blocked} merges (exceeded even relaxed threshold)")
 
     # Local smoothing: if a pixel has a very similar neighbor, use the more common color in 3x3 block
     similar_neighbor_threshold = 12.0  # Colors within this distance are "super close"
@@ -942,8 +988,9 @@ def extract_pixel_art(
                     best_count = count
 
             if best_color != color:
-                snapped_grid[(col, row)] = best_color
-                smoothed += 1
+                if is_valid_color((col, row), best_color, is_rare=False):
+                    snapped_grid[(col, row)] = best_color
+                    smoothed += 1
 
     if smoothed and verbose:
         print(f"  Smoothed {smoothed} pixels to match local neighbors")
@@ -1024,10 +1071,22 @@ def extract_pixel_art(
     if adjacency_merges and verbose:
         print(f"  Merged {len(adjacency_merges)} artifact colors (isolated/always adjacent to similar)")
 
-    # Apply adjacency merges
+    # Apply adjacency merges (with max_deviation check)
+    # Colors being merged away that are rare get relaxed threshold
+    adj_applied = 0
+    adj_blocked = 0
     for pos, color in list(snapped_grid.items()):
         if color in adjacency_merges:
-            snapped_grid[pos] = adjacency_merges[color]
+            new_color = adjacency_merges[color]
+            pixel_count = total_pixels.get(color, 1)
+            is_rare = pixel_count < rarity_threshold
+            if is_valid_color(pos, new_color, is_rare=is_rare):
+                snapped_grid[pos] = new_color
+                adj_applied += 1
+            else:
+                adj_blocked += 1
+    if adj_blocked and verbose:
+        print(f"    Blocked {adj_blocked} merges that would exceed max_deviation")
 
     # Update palette
     used_colors = set(snapped_grid.values())
@@ -1038,9 +1097,8 @@ def extract_pixel_art(
     for color in snapped_grid.values():
         color_counts[color] = color_counts.get(color, 0) + 1
 
-    rare_colors = {c for c, count in color_counts.items() if count < min_color_count}
+    rare_colors = {c for c, count in color_counts.items() if count < rarity_threshold}
     if rare_colors:
-        palette_set = set(tuple(c) for c in palette)
         rare_mapping = {}
         for rare in rare_colors:
             best_dist = float('inf')
@@ -1052,16 +1110,26 @@ def extract_pixel_art(
                     if dist < best_dist:
                         best_dist = dist
                         best_color = other_tuple
-            # Only merge if within threshold (same as first pass)
-            if best_color and best_dist <= rare_color_threshold:
+            # Only merge if within threshold
+            if best_color and best_dist <= rare_color_merge_threshold:
                 rare_mapping[rare] = best_color
 
         if rare_mapping:
-            for pos, color in snapped_grid.items():
+            cleanup_applied = 0
+            cleanup_blocked = 0
+            for pos, color in list(snapped_grid.items()):
                 if color in rare_mapping:
-                    snapped_grid[pos] = rare_mapping[color]
+                    new_color = rare_mapping[color]
+                    # These are rare colors, use relaxed threshold
+                    if is_valid_color(pos, new_color, is_rare=True):
+                        snapped_grid[pos] = new_color
+                        cleanup_applied += 1
+                    else:
+                        cleanup_blocked += 1
             if verbose:
-                print(f"  Cleaned up {len(rare_mapping)} newly-rare colors after artifact merge")
+                print(f"  Cleaned up {cleanup_applied} newly-rare colors after artifact merge")
+                if cleanup_blocked:
+                    print(f"    Blocked {cleanup_blocked} cleanups (exceeded even relaxed threshold)")
 
         # Update palette again
         used_colors = set(snapped_grid.values())
@@ -1092,12 +1160,113 @@ def extract_pixel_art(
     if len(final_palette) < len(palette_list) and verbose:
         print(f"  Merged {len(palette_list) - len(final_palette)} similar palette colors")
 
-    # Re-snap pixels to merged palette
-    for pos, color in snapped_grid.items():
+    # Re-snap pixels to merged palette (with max_deviation check)
+    # Rare colors get relaxed threshold
+    merge_applied = 0
+    merge_blocked = 0
+    for pos, color in list(snapped_grid.items()):
         if color in merged_palette_map:
-            snapped_grid[pos] = merged_palette_map[color]
+            new_color = merged_palette_map[color]
+            if new_color != color:  # Only check if actually changing
+                is_rare = palette_usage.get(color, 0) < rarity_threshold
+                if is_valid_color(pos, new_color, is_rare=is_rare):
+                    snapped_grid[pos] = new_color
+                    merge_applied += 1
+                else:
+                    merge_blocked += 1
+    if merge_blocked and verbose:
+        print(f"    Blocked {merge_blocked} palette merges that would exceed max_deviation")
 
     palette = list(final_palette)
+
+    # Add back any colors that couldn't be merged due to max_deviation
+    used_colors = set(snapped_grid.values())
+    for color in used_colors:
+        if color not in [tuple(p) for p in palette]:
+            palette.append(color)
+
+    # Final palette optimization: adjust each palette color to be the centroid
+    # of the original (true) colors of all pixels assigned to it
+    # This minimizes average error for each palette color
+    if verbose:
+        print("  Optimizing palette colors to minimize error...")
+
+    # Group pixels by their current palette color
+    color_to_positions: dict[tuple, list[tuple]] = {}
+    for pos, color in snapped_grid.items():
+        if color not in color_to_positions:
+            color_to_positions[color] = []
+        color_to_positions[color].append(pos)
+
+    # Compute optimal color for each palette entry (average of original colors)
+    optimized_palette = []
+    color_remap = {}  # old palette color -> new optimized color
+
+    for palette_color in palette:
+        palette_tuple = tuple(palette_color) if not isinstance(palette_color, tuple) else palette_color
+        positions = color_to_positions.get(palette_tuple, [])
+
+        if not positions:
+            optimized_palette.append(palette_color)
+            color_remap[palette_tuple] = palette_tuple
+            continue
+
+        # Get original colors for all pixels with this palette color
+        orig_colors = [original_colors[pos] for pos in positions]
+
+        # Compute average
+        avg_r = sum(c[0] for c in orig_colors) // len(orig_colors)
+        avg_g = sum(c[1] for c in orig_colors) // len(orig_colors)
+        avg_b = sum(c[2] for c in orig_colors) // len(orig_colors)
+        optimal_color = (avg_r, avg_g, avg_b, 255)
+
+        # Verify this doesn't exceed max_deviation for any pixel
+        all_valid = all(
+            color_distance(original_colors[pos][:3], optimal_color[:3]) <= max_deviation
+            for pos in positions
+        )
+
+        if all_valid:
+            optimized_palette.append(optimal_color)
+            color_remap[palette_tuple] = optimal_color
+        else:
+            # Keep original palette color
+            optimized_palette.append(palette_color)
+            color_remap[palette_tuple] = palette_tuple
+
+    # Apply optimized colors
+    for pos, color in list(snapped_grid.items()):
+        if color in color_remap:
+            snapped_grid[pos] = color_remap[color]
+
+    palette = optimized_palette
+
+    # Final pass: re-snap each pixel to the closest palette color based on its
+    # original (pass1) sampled color. This ensures we're using the best match
+    # after all palette optimization/merging.
+    resnapped = 0
+    palette_tuples = [tuple(c) if not isinstance(c, tuple) else c for c in palette]
+    for pos in snapped_grid:
+        orig_color = original_colors[pos]
+        current = snapped_grid[pos]
+        # Find closest palette color to original
+        best_color = current
+        best_dist = color_distance(orig_color[:3], current[:3])
+        for p in palette_tuples:
+            dist = color_distance(orig_color[:3], p[:3])
+            if dist < best_dist:
+                best_dist = dist
+                best_color = p
+        if best_color != current:
+            snapped_grid[pos] = best_color
+            resnapped += 1
+
+    if resnapped and verbose:
+        print(f"  Re-snapped {resnapped} pixels to closest palette color")
+
+    # Update palette to only include used colors
+    used_colors = set(snapped_grid.values())
+    palette = [c for c in palette if tuple(c) in used_colors]
 
     if verbose:
         hex_colors = ['#' + ''.join(f'{c:02x}' for c in p[:3]) for p in palette]
