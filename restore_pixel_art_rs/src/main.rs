@@ -113,17 +113,38 @@ fn find_period_autocorr(signal: &[f64], min_period: usize, max_period: usize) ->
         signal.iter().map(|x| x - mean).collect()
     };
 
-    let mut best_period = min_period;
-    let mut best_score = 0.0;
+    // Collect scores for all periods, weighted by inverse sqrt(period)
+    // This favors smaller periods (more likely to be the fundamental)
+    let max_p = max_period.min(n / 2);
+    let mut scores: Vec<(usize, f64, f64)> = Vec::new(); // (period, raw_score, weighted_score)
 
-    for period in min_period..=max_period.min(n / 2) {
+    for period in min_period..=max_p {
         let mut score = 0.0;
         for i in 0..(n - period) {
             score += normalized[i] * normalized[i + period];
         }
-        if score > best_score * 1.1 {
-            best_score = score;
-            best_period = period;
+        let weighted = score / (period as f64).sqrt();
+        scores.push((period, score, weighted));
+    }
+
+    if scores.is_empty() {
+        return min_period;
+    }
+
+    // Find best by weighted score
+    let (best_period, _best_raw, best_weighted) = scores
+        .iter()
+        .max_by(|a, b| a.2.partial_cmp(&b.2).unwrap())
+        .copied()
+        .unwrap();
+
+    // Check if a smaller period is a divisor and has good weighted score
+    for &(period, _raw, weighted) in &scores {
+        if period >= best_period {
+            break;
+        }
+        if best_period % period == 0 && weighted >= best_weighted * 0.8 {
+            return period;
         }
     }
 

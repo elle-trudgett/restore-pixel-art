@@ -511,17 +511,26 @@ def find_period_autocorr(signal: np.ndarray, min_period: int = 3, max_period: in
     autocorr = np.correlate(signal, signal, mode='full')
     autocorr = autocorr[n-1:]  # Take positive lags only
 
-    # Find peaks in autocorrelation (excluding lag 0)
-    # Prefer smaller periods - only switch to larger if significantly better (10%+)
-    best_period = min_period
-    best_score = 0
+    # Collect scores for all periods, weighted by inverse period
+    # This favors smaller periods (more likely to be the fundamental)
+    max_p = min(max_period + 1, n // 2)
+    # Weight = score / sqrt(period) - balances raw score with period preference
+    scores = [(period, autocorr[period], autocorr[period] / np.sqrt(period))
+              for period in range(min_period, max_p)]
 
-    for period in range(min_period, min(max_period + 1, n // 2)):
-        score = autocorr[period]
-        # Require 10% improvement to prefer a larger period (avoids harmonics)
-        if score > best_score * 1.1:
-            best_score = score
-            best_period = period
+    if not scores:
+        return min_period
+
+    # Find best by weighted score
+    best_period, best_raw, best_weighted = max(scores, key=lambda x: x[2])
+
+    # Also check: if a smaller period is within 20% of best weighted score
+    # and is a divisor of the best, strongly prefer it
+    for period, raw, weighted in scores:
+        if period >= best_period:
+            break
+        if best_period % period == 0 and weighted >= best_weighted * 0.8:
+            return period
 
     return best_period
 
