@@ -1601,6 +1601,10 @@ def extract_pixel_art(
     inner_radius_h = max(1, int(cell_h * inner_fraction / 2))
 
     for col, row, cx, cy in centers:
+        # Clamp center to valid bounds
+        cx = max(0, min(img.size[0] - 1, cx))
+        cy = max(0, min(img.size[1] - 1, cy))
+
         # Sample inner region of the cell
         x1 = max(0, cx - inner_radius_w)
         x2 = min(img.size[0], cx + inner_radius_w + 1)
