@@ -14,6 +14,22 @@ Restore clean pixel art from degraded sources:
 - Automatic cleanup of rare/artifact colors
 - Adjacency-aware merging to remove compression artifacts
 
+## Demo
+
+Restoring pixel art from JPG:
+
+<img width="855" height="1002" alt="ezgif com-apng-maker" src="https://github.com/user-attachments/assets/c16b7dcc-2f49-4d8f-8b2b-b8d8b71324fe" />
+<img width="840" height="990" alt="ezgif com-apng-maker (3)" src="https://github.com/user-attachments/assets/821364f0-07c8-4067-ac1a-6bc90a9a6b7c" />
+
+Nano Banana 2 image to pixel art:
+
+<img width="864" height="672" alt="ezgif com-apng-maker (1)" src="https://github.com/user-attachments/assets/e51f1513-80d4-4247-8c9b-4f3bd9a89055" />
+
+Older AI generated pixel art:
+
+<img width="799" height="592" alt="ezgif com-apng-maker (2)" src="https://github.com/user-attachments/assets/348b8dfc-1c5d-4407-b440-5f2c893bb5bb" />
+
+
 ## Installation
 
 ```bash
