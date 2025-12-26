@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "restore-pixel-art"
+version = "0.1.0"
+description = "Extract clean pixel art from AI-generated upscaled images"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "pillow",
+    "scipy",
+]
+
+[project.scripts]
+restore-pixel-art = "restore_pixel_art.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["restore_pixel_art"]
